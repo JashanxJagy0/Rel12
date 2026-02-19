@@ -2128,6 +2128,246 @@ class DepositDatabase:
         conn.close()
 
 
+# ===== DB-BACKED BOT SETTINGS UTILITY FUNCTIONS =====
+
+def get_bot_setting(setting_name, default=True):
+    """Get a bot setting from the database. Returns the is_active value or default if not found."""
+    try:
+        conn = sqlite3.connect(DEPOSITS_DB)
+        cursor = conn.cursor()
+        cursor.execute('SELECT is_active FROM bot_settings WHERE setting_name = ?', (setting_name,))
+        result = cursor.fetchone()
+        conn.close()
+        return bool(result[0]) if result else default
+    except Exception as e:
+        logging.error(f"Error reading bot setting '{setting_name}': {e}")
+        return default
+
+def set_bot_setting(setting_name, is_active):
+    """Set a bot setting in the database. Creates if not exists."""
+    try:
+        conn = sqlite3.connect(DEPOSITS_DB)
+        cursor = conn.cursor()
+        cursor.execute(
+            'INSERT INTO bot_settings (setting_name, is_active) VALUES (?, ?) '
+            'ON CONFLICT(setting_name) DO UPDATE SET is_active = ?',
+            (setting_name, int(is_active), int(is_active))
+        )
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        logging.error(f"Error setting bot setting '{setting_name}': {e}")
+        return False
+
+def toggle_bot_setting(setting_name):
+    """Toggle a bot setting and return the new value."""
+    current = get_bot_setting(setting_name, default=True)
+    new_value = not current
+    set_bot_setting(setting_name, new_value)
+    return new_value
+
+
+# ===== REFERRAL BALANCE TRACKING (MULTI-CURRENCY) =====
+
+def get_referral_balance(user_id, currency):
+    """Get a user's referral commission balance for a specific currency."""
+    try:
+        conn = sqlite3.connect(DEPOSITS_DB)
+        cursor = conn.cursor()
+        cursor.execute(
+            'SELECT balance FROM referral_balances WHERE user_id = ? AND currency = ?',
+            (user_id, currency)
+        )
+        result = cursor.fetchone()
+        conn.close()
+        return result[0] if result else 0.0
+    except Exception as e:
+        logging.error(f"Error reading referral balance for user {user_id}, {currency}: {e}")
+        return 0.0
+
+def get_all_referral_balances(user_id):
+    """Get all referral commission balances for a user across all currencies."""
+    try:
+        conn = sqlite3.connect(DEPOSITS_DB)
+        cursor = conn.cursor()
+        cursor.execute(
+            'SELECT currency, balance FROM referral_balances WHERE user_id = ? AND balance > 0',
+            (user_id,)
+        )
+        results = cursor.fetchall()
+        conn.close()
+        return {row[0]: row[1] for row in results}
+    except Exception as e:
+        logging.error(f"Error reading referral balances for user {user_id}: {e}")
+        return {}
+
+def add_referral_commission(user_id, currency, amount):
+    """Add referral commission to a user's balance for a specific currency."""
+    try:
+        conn = sqlite3.connect(DEPOSITS_DB)
+        cursor = conn.cursor()
+        cursor.execute(
+            'INSERT INTO referral_balances (user_id, currency, balance) VALUES (?, ?, ?) '
+            'ON CONFLICT(user_id, currency) DO UPDATE SET balance = balance + ?',
+            (user_id, currency, amount, amount)
+        )
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        logging.error(f"Error adding referral commission for user {user_id}, {currency}: {e}")
+        return False
+
+def claim_referral_balance(user_id, currency):
+    """Claim (withdraw) referral balance for a specific currency. Returns the claimed amount."""
+    try:
+        conn = sqlite3.connect(DEPOSITS_DB)
+        cursor = conn.cursor()
+        cursor.execute(
+            'SELECT balance FROM referral_balances WHERE user_id = ? AND currency = ?',
+            (user_id, currency)
+        )
+        result = cursor.fetchone()
+        if not result or result[0] <= 0:
+            conn.close()
+            return 0.0
+        claimed = result[0]
+        cursor.execute(
+            'UPDATE referral_balances SET balance = 0.0 WHERE user_id = ? AND currency = ?',
+            (user_id, currency)
+        )
+        conn.commit()
+        conn.close()
+        return claimed
+    except Exception as e:
+        logging.error(f"Error claiming referral balance for user {user_id}, {currency}: {e}")
+        return 0.0
+
+
+# ===== RAFFLE SYSTEM DB FUNCTIONS =====
+
+def create_raffle(raffle_id, creator_id, raffle_type, prize_usd, wager_per_ticket, end_time, winners_count=1):
+    """Create a new raffle in the database."""
+    try:
+        conn = sqlite3.connect(DEPOSITS_DB)
+        cursor = conn.cursor()
+        cursor.execute(
+            'INSERT INTO raffles (raffle_id, creator_id, type, prize_usd, wager_per_ticket, end_time, winners_count, status) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            (raffle_id, creator_id, raffle_type, prize_usd, wager_per_ticket, end_time, winners_count, 'active')
+        )
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        logging.error(f"Error creating raffle {raffle_id}: {e}")
+        return False
+
+def get_active_raffles():
+    """Get all active raffles."""
+    try:
+        conn = sqlite3.connect(DEPOSITS_DB)
+        cursor = conn.cursor()
+        cursor.execute(
+            'SELECT raffle_id, creator_id, type, prize_usd, wager_per_ticket, end_time, winners_count, status '
+            'FROM raffles WHERE status = ? ORDER BY end_time ASC',
+            ('active',)
+        )
+        results = cursor.fetchall()
+        conn.close()
+        return [
+            {
+                'raffle_id': r[0], 'creator_id': r[1], 'type': r[2], 'prize_usd': r[3],
+                'wager_per_ticket': r[4], 'end_time': r[5], 'winners_count': r[6], 'status': r[7]
+            }
+            for r in results
+        ]
+    except Exception as e:
+        logging.error(f"Error fetching active raffles: {e}")
+        return []
+
+def get_raffle(raffle_id):
+    """Get a specific raffle by ID."""
+    try:
+        conn = sqlite3.connect(DEPOSITS_DB)
+        cursor = conn.cursor()
+        cursor.execute(
+            'SELECT raffle_id, creator_id, type, prize_usd, wager_per_ticket, end_time, winners_count, status '
+            'FROM raffles WHERE raffle_id = ?',
+            (raffle_id,)
+        )
+        r = cursor.fetchone()
+        conn.close()
+        if r:
+            return {
+                'raffle_id': r[0], 'creator_id': r[1], 'type': r[2], 'prize_usd': r[3],
+                'wager_per_ticket': r[4], 'end_time': r[5], 'winners_count': r[6], 'status': r[7]
+            }
+        return None
+    except Exception as e:
+        logging.error(f"Error fetching raffle {raffle_id}: {e}")
+        return None
+
+def add_raffle_wager(raffle_id, user_id, wager_usd):
+    """Add wager amount toward a raffle for a user."""
+    try:
+        conn = sqlite3.connect(DEPOSITS_DB)
+        cursor = conn.cursor()
+        cursor.execute(
+            'INSERT INTO raffle_wagers (raffle_id, user_id, total_wagered_usd) VALUES (?, ?, ?) '
+            'ON CONFLICT(raffle_id, user_id) DO UPDATE SET total_wagered_usd = total_wagered_usd + ?',
+            (raffle_id, user_id, wager_usd, wager_usd)
+        )
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        logging.error(f"Error adding raffle wager for user {user_id}, raffle {raffle_id}: {e}")
+        return False
+
+def get_raffle_tickets(raffle_id):
+    """Get all participants and their ticket counts for a raffle."""
+    try:
+        raffle = get_raffle(raffle_id)
+        if not raffle:
+            return []
+        wager_per_ticket = raffle['wager_per_ticket']
+        if wager_per_ticket <= 0:
+            return []
+        conn = sqlite3.connect(DEPOSITS_DB)
+        cursor = conn.cursor()
+        cursor.execute(
+            'SELECT user_id, total_wagered_usd FROM raffle_wagers WHERE raffle_id = ? AND total_wagered_usd > 0',
+            (raffle_id,)
+        )
+        results = cursor.fetchall()
+        conn.close()
+        return [
+            {'user_id': r[0], 'total_wagered': r[1], 'tickets': int(r[1] // wager_per_ticket)}
+            for r in results if int(r[1] // wager_per_ticket) > 0
+        ]
+    except Exception as e:
+        logging.error(f"Error fetching raffle tickets for {raffle_id}: {e}")
+        return []
+
+def complete_raffle(raffle_id):
+    """Mark a raffle as completed."""
+    try:
+        conn = sqlite3.connect(DEPOSITS_DB)
+        cursor = conn.cursor()
+        cursor.execute(
+            'UPDATE raffles SET status = ? WHERE raffle_id = ?',
+            ('completed', raffle_id)
+        )
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        logging.error(f"Error completing raffle {raffle_id}: {e}")
+        return False
+
+
 class HDWalletManager:
     """HD Wallet Manager for multi-chain address generation"""
     
@@ -5082,10 +5322,14 @@ async def process_referral_commission(user_id, amount, commission_type):
     commission = amount * rate
     if commission > 0:
         await ensure_user_in_wallets(referrer_id)
+        # Credit to the referrer's active currency wallet (in-memory)
         credit_wallet(referrer_id, commission)
         user_stats[referrer_id]['referral']['commission_earned'] += commission
         save_user_data(referrer_id)
-        logging.info(f"Awarded ${commission:.4f} commission to referrer {referrer_id} from user {user_id}'s {commission_type}.")
+        # Also track in the multi-currency referral_balances DB table
+        currency = get_active_currency(user_id)
+        add_referral_commission(referrer_id, currency, commission)
+        logging.info(f"Awarded ${commission:.4f} ({currency}) commission to referrer {referrer_id} from user {user_id}'s {commission_type}.")
 
 def update_stats_on_withdrawal(user_id, amount, tx_hash, method):
     stats = user_stats[user_id]
@@ -15268,11 +15512,7 @@ async def continue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=mines_keyboard(game_id))
     elif game_type == 'tower':
         text = f"🏗️ Resuming Tower Game (ID: <code>{game_id}</code>)..."
-        keyboard = create_tower_keyboard(game_id, game['current_row'], [], game['tower_config'][game['current_row']])
-        if game['current_row'] > 0:
-            multiplier = TOWER_MULTIPLIERS[game["bombs_per_row"]][game["current_row"]]
-            potential_winnings = game["bet_amount"] * multiplier
-            keyboard.append([InlineKeyboardButton(f"💸 Cash Out (${potential_winnings:.2f})", callback_data=f"tower_cashout_{game_id}")])
+        keyboard = build_tower_keyboard(game)
         await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
     elif game_type == 'coin_flip':
         text = f"🪙 Resuming Coin Flip (ID: <code>{game_id}</code>)..."
@@ -15300,6 +15540,38 @@ async def continue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{text}\n\n{hand_text}\n{dealer_text}\n💰 Bet: ${game['bet_amount']:.2f}",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    # FIX: Add HiLo (highlow) continuation
+    elif game_type == 'highlow':
+        text = f"🎴 Resuming High-Low Game (ID: <code>{game_id}</code>)..."
+        current_card = game.get("current_card", 7)
+        deck = game.get("deck", [])
+        win_amount = game["bet_amount"] * game.get("current_multiplier", 1.0)
+        card_name = get_card_name(current_card)
+        
+        high_mult = calculate_highlow_multiplier(current_card, deck, "high")
+        low_mult = calculate_highlow_multiplier(current_card, deck, "low")
+        tie_mult = calculate_highlow_multiplier(current_card, deck, "tie")
+        
+        row1 = []
+        if current_card != 13:
+            row1.append(apply_button_style(InlineKeyboardButton(f"⬆️ Higher ({high_mult:.2f}x)", callback_data=f"hl_pick_{game_id}_high"), 'primary'))
+        if current_card != 1:
+            row1.append(apply_button_style(InlineKeyboardButton(f"⬇️ Lower ({low_mult:.2f}x)", callback_data=f"hl_pick_{game_id}_low"), 'success'))
+        row2 = [apply_button_style(InlineKeyboardButton(f"🔄 Tie ({tie_mult:.2f}x)", callback_data=f"hl_pick_{game_id}_tie"), 'primary')]
+        row3 = [apply_button_style(InlineKeyboardButton("⏭️ Skip Card", callback_data=f"hl_skip_{game_id}"), 'primary')]
+        if game.get("streak", 0) > 0:
+            row3.append(apply_button_style(InlineKeyboardButton(f"💸 Cash Out (${win_amount:.2f})", callback_data=f"hl_cashout_{game_id}"), 'success'))
+        keyboard = [row1, row2, row3]
+        
+        await update.message.reply_text(
+            f"{text}\n\n"
+            f"🃏 Current Card: <b>{card_name}</b>\n"
+            f"💰 Current Win: <b>${win_amount:.2f}</b>\n"
+            f"🔥 Streak: {game.get('streak', 0)}\n"
+            f"📊 Cards remaining: {len(deck)}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=create_styled_keyboard(keyboard)
         )
     else:
         await update.message.reply_text("This game type cannot be continued.")
@@ -15580,11 +15852,22 @@ async def referral_command(update: Update, context: ContextTypes.DEFAULT_TYPE, f
     stats = user_stats[user.id]
     ref_info = stats.get('referral', {})
 
+    # Get multi-currency referral balances from DB
+    ref_balances = get_all_referral_balances(user.id)
+    balance_text = ""
+    if ref_balances:
+        balance_text = "\n💎 <b>Commission Balances by Currency:</b>\n"
+        for currency, balance in ref_balances.items():
+            balance_text += f"  • {currency}: {balance:.6f}\n"
+    else:
+        balance_text = "\n<i>No commission balances yet.</i>\n"
+
     msg = (f"🤝 <b>Your Referral Dashboard</b> 🤝\n\n"
            f"Share your unique link to earn commissions!\n\n"
            f"🔗 <b>Your Link:</b>\n<code>{referral_link}</code>\n\n"
            f"👥 <b>Total Referrals:</b> {len(ref_info.get('referred_users', []))}\n"
-           f"💰 <b>Total Commission Earned:</b> ${ref_info.get('commission_earned', 0.0):.4f}\n\n"
+           f"💰 <b>Total Commission Earned:</b> ${ref_info.get('commission_earned', 0.0):.4f}\n"
+           f"{balance_text}\n"
            f"<b>Commission Rate:</b>\n"
            f"- <b>{REFERRAL_BET_COMMISSION_RATE*100}%</b> of every bet amount placed by your referrals.")
 
@@ -18316,6 +18599,12 @@ def main():
     app.add_handler(CommandHandler("lockall", lockall_command))
     app.add_handler(CommandHandler("unlockall", unlockall_command))
     
+    # ===== MODULE TOGGLE & RAFFLE SYSTEM =====
+    app.add_handler(CommandHandler("toggle", toggle_command))  # Admin: toggle bot settings
+    app.add_handler(CommandHandler("raffle_create", raffle_create_command))  # Admin: create raffle
+    app.add_handler(CommandHandler("raffles", raffle_list_command))  # View active raffles
+    app.add_handler(CommandHandler("raffle_draw", raffle_draw_command))  # Admin: draw raffle winners
+    
     # ===== DEPOSIT SYSTEM HANDLERS =====
     app.add_handler(CommandHandler("deposit", deposit_command))
     app.add_handler(CallbackQueryHandler(deposit_method_callback, pattern=r"^deposit_(ETH|BNB|BASE|TRON|SOLANA|TON)$"))
@@ -19377,9 +19666,203 @@ async def monthly_bonus_command(update: Update, context: ContextTypes.DEFAULT_TY
     else:
         await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
+
+# ===== MODULE TOGGLE COMMAND (ADMIN) =====
+
+async def toggle_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command: /toggle <setting_name> — Toggle a module on/off in the DB-backed bot_settings table.
+    Usage: /toggle escrow_enabled | /toggle ai_enabled | /toggle list
+    """
+    user = update.effective_user
+    if not is_admin(user.id):
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "⚙️ <b>Module Toggle</b>\n\n"
+            "Usage: <code>/toggle &lt;setting_name&gt;</code>\n"
+            "Example: <code>/toggle escrow_enabled</code>\n"
+            "Use <code>/toggle list</code> to see all settings.",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    setting_name = context.args[0].lower()
+
+    if setting_name == 'list':
+        try:
+            conn = sqlite3.connect(DEPOSITS_DB)
+            cursor = conn.cursor()
+            cursor.execute('SELECT setting_name, is_active FROM bot_settings ORDER BY setting_name')
+            rows = cursor.fetchall()
+            conn.close()
+            if rows:
+                text = "⚙️ <b>Bot Settings (DB)</b>\n\n"
+                for name, active in rows:
+                    status = "✅ ON" if active else "❌ OFF"
+                    text += f"  • <code>{name}</code>: {status}\n"
+            else:
+                text = "No settings found in database."
+            await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+        except Exception as e:
+            await update.message.reply_text(f"Error: {e}")
+        return
+
+    new_value = toggle_bot_setting(setting_name)
+    status = "✅ ON" if new_value else "❌ OFF"
+    await update.message.reply_text(
+        f"⚙️ Toggled <code>{setting_name}</code> → {status}",
+        parse_mode=ParseMode.HTML
+    )
+
+
+# ===== RAFFLE SYSTEM COMMAND HANDLERS =====
+
+async def raffle_create_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command: /raffle_create <type> <prize_usd> <wager_per_ticket> <duration_hours> [winners_count]
+    Example: /raffle_create global 100 10 24 3
+    """
+    user = update.effective_user
+    if not is_admin(user.id):
+        return
+
+    if not context.args or len(context.args) < 4:
+        await update.message.reply_text(
+            "🎟️ <b>Create Raffle</b>\n\n"
+            "Usage: <code>/raffle_create &lt;type&gt; &lt;prize_usd&gt; &lt;wager_per_ticket&gt; &lt;duration_hours&gt; [winners_count]</code>\n\n"
+            "Types: <code>global</code> or <code>referral</code>\n"
+            "Example: <code>/raffle_create global 100 10 24 3</code>",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    try:
+        raffle_type = context.args[0].lower()
+        if raffle_type not in ('global', 'referral'):
+            await update.message.reply_text("❌ Type must be 'global' or 'referral'.")
+            return
+        prize_usd = float(context.args[1])
+        wager_per_ticket = float(context.args[2])
+        duration_hours = float(context.args[3])
+        winners_count = int(context.args[4]) if len(context.args) > 4 else 1
+
+        raffle_id = f"RAFFLE_{int(datetime.now(timezone.utc).timestamp())}_{user.id}"
+        end_time = (datetime.now(timezone.utc) + timedelta(hours=duration_hours)).isoformat()
+
+        if create_raffle(raffle_id, user.id, raffle_type, prize_usd, wager_per_ticket, end_time, winners_count):
+            await update.message.reply_text(
+                f"🎟️ <b>Raffle Created!</b>\n\n"
+                f"ID: <code>{raffle_id}</code>\n"
+                f"Type: {raffle_type}\n"
+                f"Prize: ${prize_usd:.2f}\n"
+                f"Wager/Ticket: ${wager_per_ticket:.2f}\n"
+                f"Duration: {duration_hours}h\n"
+                f"Winners: {winners_count}",
+                parse_mode=ParseMode.HTML
+            )
+        else:
+            await update.message.reply_text("❌ Failed to create raffle.")
+    except (ValueError, IndexError) as e:
+        await update.message.reply_text(f"❌ Invalid parameters: {e}")
+
+
+async def raffle_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show active raffles: /raffles"""
+    user = update.effective_user
+    await ensure_user_in_wallets(user.id, user.username, context=context)
+
+    raffles = get_active_raffles()
+    if not raffles:
+        await update.message.reply_text("🎟️ No active raffles right now. Check back later!")
+        return
+
+    text = "🎟️ <b>Active Raffles</b>\n\n"
+    for r in raffles:
+        tickets = get_raffle_tickets(r['raffle_id'])
+        total_tickets = sum(t['tickets'] for t in tickets)
+        text += (
+            f"📌 <b>{r['raffle_id']}</b>\n"
+            f"  Type: {r['type']} | Prize: ${r['prize_usd']:.2f}\n"
+            f"  Wager/Ticket: ${r['wager_per_ticket']:.2f}\n"
+            f"  Ends: {r['end_time'][:19]}\n"
+            f"  Winners: {r['winners_count']} | Total Tickets: {total_tickets}\n\n"
+        )
+
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+async def raffle_draw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command: /raffle_draw <raffle_id> — Draw winners for a raffle."""
+    user = update.effective_user
+    if not is_admin(user.id):
+        return
+
+    if not context.args:
+        await update.message.reply_text("Usage: <code>/raffle_draw &lt;raffle_id&gt;</code>", parse_mode=ParseMode.HTML)
+        return
+
+    raffle_id = context.args[0]
+    raffle = get_raffle(raffle_id)
+    if not raffle:
+        await update.message.reply_text("❌ Raffle not found.")
+        return
+    if raffle['status'] != 'active':
+        await update.message.reply_text("❌ This raffle is already completed.")
+        return
+
+    tickets = get_raffle_tickets(raffle_id)
+    if not tickets:
+        await update.message.reply_text("❌ No participants in this raffle.")
+        complete_raffle(raffle_id)
+        return
+
+    # Build ticket pool: each user gets entries equal to their ticket count
+    ticket_pool = []
+    for t in tickets:
+        ticket_pool.extend([t['user_id']] * t['tickets'])
+
+    if not ticket_pool:
+        await update.message.reply_text("❌ No valid tickets in this raffle.")
+        complete_raffle(raffle_id)
+        return
+
+    # Draw winners (without replacement if possible)
+    winners_count = min(raffle['winners_count'], len(set(ticket_pool)))
+    winners = []
+    pool_copy = ticket_pool[:]
+    for _ in range(winners_count):
+        if not pool_copy:
+            break
+        winner = random.choice(pool_copy)
+        winners.append(winner)
+        # Remove all entries for this winner to avoid duplicates
+        pool_copy = [uid for uid in pool_copy if uid != winner]
+
+    # Credit winners
+    prize_per_winner = raffle['prize_usd'] / len(winners) if winners else 0
+    winner_text = ""
+    for w in winners:
+        try:
+            await ensure_user_in_wallets(w)
+            credit_wallet(w, prize_per_winner)
+            save_user_data(w)
+        except Exception as e:
+            logging.error(f"Error crediting raffle winner {w}: {e}")
+        winner_text += f"  🏆 User {w}: ${prize_per_winner:.2f}\n"
+
+    complete_raffle(raffle_id)
+
+    await update.message.reply_text(
+        f"🎟️ <b>Raffle Draw Complete!</b>\n\n"
+        f"Raffle: <code>{raffle_id}</code>\n"
+        f"Prize: ${raffle['prize_usd']:.2f}\n\n"
+        f"<b>Winners:</b>\n{winner_text}",
+        parse_mode=ParseMode.HTML
+    )
+
+
 @check_banned
 @check_maintenance
-async def demo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /demo - Users claim demo amount (once per cooldown period)
     /demo amount - Admin sets demo amount
