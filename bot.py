@@ -2343,10 +2343,12 @@ def get_raffle_tickets(raffle_id):
         )
         results = cursor.fetchall()
         conn.close()
-        return [
-            {'user_id': r[0], 'total_wagered': r[1], 'tickets': int(r[1] // wager_per_ticket)}
-            for r in results if int(r[1] // wager_per_ticket) > 0
-        ]
+        entries = []
+        for r in results:
+            ticket_count = int(r[1] // wager_per_ticket)
+            if ticket_count > 0:
+                entries.append({'user_id': r[0], 'total_wagered': r[1], 'tickets': ticket_count})
+        return entries
     except Exception as e:
         logging.error(f"Error fetching raffle tickets for {raffle_id}: {e}")
         return []
@@ -19746,7 +19748,7 @@ async def raffle_create_command(update: Update, context: ContextTypes.DEFAULT_TY
         duration_hours = float(context.args[3])
         winners_count = int(context.args[4]) if len(context.args) > 4 else 1
 
-        raffle_id = f"RAFFLE_{int(datetime.now(timezone.utc).timestamp())}_{user.id}"
+        raffle_id = f"RAFFLE_{int(datetime.now(timezone.utc).timestamp())}_{random.randint(1000, 9999)}"
         end_time = (datetime.now(timezone.utc) + timedelta(hours=duration_hours)).isoformat()
 
         if create_raffle(raffle_id, user.id, raffle_type, prize_usd, wager_per_ticket, end_time, winners_count):
@@ -19863,6 +19865,7 @@ async def raffle_draw_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 @check_banned
 @check_maintenance
+async def demo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /demo - Users claim demo amount (once per cooldown period)
     /demo amount - Admin sets demo amount
