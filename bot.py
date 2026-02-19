@@ -2874,8 +2874,8 @@ class BlockMonitor:
             # Check current native balance as a quick indicator
             native_balance = await service.get_balance(address)
             if native_balance > 0.0001:
-                # Generate a deterministic tx_hash based on balance+block to track this deposit
-                tx_hash = f"native_{chain}_{address}_{current_block}"
+                # Generate a deterministic tx_hash based on balance+block+address to track this deposit
+                tx_hash = f"native_{chain}_{address}_{current_block}_{native_balance:.8f}"
                 
                 if not self.db.is_tx_processed(tx_hash):
                     symbol = 'ETH' if chain in ('ETH', 'BASE') else chain
@@ -2911,8 +2911,8 @@ class BlockMonitor:
             if chain in TOKEN_CONTRACTS:
                 # ERC20 Transfer event signature: Transfer(address,address,uint256)
                 transfer_topic = Web3.keccak(text="Transfer(address,address,uint256)").hex()
-                # Pad the recipient address to 32 bytes for topic filtering
-                padded_address = '0x' + checksum_addr[2:].lower().zfill(64)
+                # Pad the recipient address to 32 bytes for topic filtering (preserve hex without case conversion)
+                padded_address = '0x' + checksum_addr[2:].zfill(64)
                 
                 for token_name, token_info in TOKEN_CONTRACTS[chain].items():
                     try:
@@ -2987,7 +2987,7 @@ class BlockMonitor:
             # Check native balance
             balance = await service.get_balance(address)
             if balance > 0.0001:
-                tx_hash = f"native_{chain}_{address}_{int(datetime.now().timestamp())}"
+                tx_hash = f"native_{chain}_{address}_{balance:.8f}"
                 
                 if not self.db.is_tx_processed(tx_hash):
                     symbol_map = {'TRON': 'TRX', 'SOLANA': 'SOL', 'TON': 'TON'}
@@ -3032,7 +3032,7 @@ class BlockMonitor:
                             )
                         
                         if token_balance > 1:
-                            tx_hash = f"token_{chain}_{token_name}_{address}_{int(datetime.now().timestamp())}"
+                            tx_hash = f"token_{chain}_{token_name}_{address}_{token_balance:.8f}"
                             
                             if not self.db.is_tx_processed(tx_hash):
                                 price_usd = await get_crypto_price_usd(token_name)
@@ -3088,18 +3088,18 @@ class AutoSweeper:
         
         try:
             self.services['TRON'] = TronService()
-        except Exception:
-            pass
+        except Exception as e:
+            logging.error(f"Error initializing TRON service: {e}")
         
         try:
             self.services['SOLANA'] = SolanaService()
-        except Exception:
-            pass
+        except Exception as e:
+            logging.error(f"Error initializing SOLANA service: {e}")
         
         try:
             self.services['TON'] = TonService()
-        except Exception:
-            pass
+        except Exception as e:
+            logging.error(f"Error initializing TON service: {e}")
     
     async def process_pending_sweeps(self):
         """Process all confirmed deposits that need sweeping"""
@@ -3174,7 +3174,10 @@ class AutoSweeper:
                         # Wait for gas transaction to confirm using receipt instead of blind sleep
                         if chain in ('ETH', 'BNB', 'BASE'):
                             try:
-                                receipt = service.w3.eth.wait_for_transaction_receipt(gas_tx, timeout=120)
+                                receipt = service.w3.eth.wait_for_transaction_receipt(
+                                                    Web3.to_bytes(hexstr=gas_tx) if isinstance(gas_tx, str) else gas_tx,
+                                                    timeout=120
+                                                )
                                 if receipt['status'] != 1:
                                     logging.error(f"Gas funding tx {gas_tx} failed with status {receipt['status']}")
                                     return
