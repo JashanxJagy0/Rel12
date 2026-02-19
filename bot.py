@@ -1744,6 +1744,12 @@ class DepositDatabase:
                 solana_address TEXT,
                 ton_address TEXT,
                 ton_private_key TEXT,
+                last_scanned_block_eth INTEGER DEFAULT 0,
+                last_scanned_block_bnb INTEGER DEFAULT 0,
+                last_scanned_block_base INTEGER DEFAULT 0,
+                last_scanned_block_tron INTEGER DEFAULT 0,
+                last_scanned_block_solana INTEGER DEFAULT 0,
+                last_scanned_block_ton INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
@@ -1755,6 +1761,16 @@ class DepositDatabase:
             logging.info("Adding ton_private_key column to user_addresses table")
             cursor.execute("ALTER TABLE user_addresses ADD COLUMN ton_private_key TEXT")
             conn.commit()
+        
+        # Migration: Add last_scanned_block columns if they don't exist
+        for chain_col in ['eth', 'bnb', 'base', 'tron', 'solana', 'ton']:
+            col_name = f"last_scanned_block_{chain_col}"
+            try:
+                cursor.execute(f"SELECT {col_name} FROM user_addresses LIMIT 1")
+            except sqlite3.OperationalError:
+                logging.info(f"Adding {col_name} column to user_addresses table")
+                cursor.execute(f"ALTER TABLE user_addresses ADD COLUMN {col_name} INTEGER DEFAULT 0")
+                conn.commit()
         
         # Deposits table
         cursor.execute('''
@@ -1779,10 +1795,85 @@ class DepositDatabase:
             )
         ''')
         
+        # Deposit transactions table - prevents double-crediting by storing every processed tx_hash
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS deposit_transactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tx_hash TEXT UNIQUE NOT NULL,
+                user_id INTEGER NOT NULL,
+                chain TEXT NOT NULL,
+                token TEXT,
+                amount REAL NOT NULL,
+                block_number INTEGER,
+                credited_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES user_addresses(user_id)
+            )
+        ''')
+        
+        # Bot settings table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS bot_settings (
+                setting_name TEXT PRIMARY KEY,
+                is_active BOOLEAN DEFAULT 1
+            )
+        ''')
+        
+        # Insert default bot settings if not present
+        cursor.execute("INSERT OR IGNORE INTO bot_settings (setting_name, is_active) VALUES ('escrow_enabled', 1)")
+        cursor.execute("INSERT OR IGNORE INTO bot_settings (setting_name, is_active) VALUES ('ai_enabled', 1)")
+        
+        # Referral balances table - track commissions per currency
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS referral_balances (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                currency TEXT NOT NULL,
+                balance REAL DEFAULT 0.0,
+                UNIQUE(user_id, currency)
+            )
+        ''')
+        
+        # Raffles table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS raffles (
+                raffle_id TEXT PRIMARY KEY,
+                creator_id INTEGER NOT NULL,
+                type TEXT NOT NULL CHECK(type IN ('global', 'referral')),
+                prize_usd REAL NOT NULL,
+                wager_per_ticket REAL NOT NULL,
+                end_time TIMESTAMP NOT NULL,
+                winners_count INTEGER DEFAULT 1,
+                status TEXT DEFAULT 'active' CHECK(status IN ('active', 'completed'))
+            )
+        ''')
+        
+        # Raffle wagers table - tracks how much a user has wagered toward a specific raffle
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS raffle_wagers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                raffle_id TEXT NOT NULL,
+                user_id INTEGER NOT NULL,
+                total_wagered_usd REAL DEFAULT 0.0,
+                UNIQUE(raffle_id, user_id),
+                FOREIGN KEY (raffle_id) REFERENCES raffles(raffle_id)
+            )
+        ''')
+        
         # Create indexes
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_deposits_user ON deposits(user_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_deposits_status ON deposits(status)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_deposits_chain ON deposits(chain)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_deposit_tx_hash ON deposit_transactions(tx_hash)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_deposit_tx_user ON deposit_transactions(user_id)')
+        
+        # Migration: Add referral columns to user_addresses if they don't exist
+        for col_name, col_def in [('referral_code', 'TEXT UNIQUE'), ('referred_by', 'INTEGER')]:
+            try:
+                cursor.execute(f"SELECT {col_name} FROM user_addresses LIMIT 1")
+            except sqlite3.OperationalError:
+                logging.info(f"Adding {col_name} column to user_addresses table")
+                cursor.execute(f"ALTER TABLE user_addresses ADD COLUMN {col_name} {col_def}")
+                conn.commit()
         
         conn.commit()
         conn.close()
@@ -1982,6 +2073,59 @@ class DepositDatabase:
         if user:
             return {'user_id': user[0], 'telegram_id': user[1], 'address_index': user[2]}
         return None
+    
+    def is_tx_processed(self, tx_hash):
+        """Check if a transaction hash has already been processed (prevents double-crediting)"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT id FROM deposit_transactions WHERE tx_hash = ?', (tx_hash,))
+        result = cursor.fetchone()
+        conn.close()
+        return result is not None
+    
+    def record_processed_tx(self, tx_hash, user_id, chain, token, amount, block_number):
+        """Record a processed transaction to prevent double-crediting"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute('''
+                INSERT INTO deposit_transactions (tx_hash, user_id, chain, token, amount, block_number)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (tx_hash, user_id, chain, token, amount, block_number))
+            conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            logging.warning(f"Transaction {tx_hash} already processed")
+            return False
+        finally:
+            conn.close()
+    
+    def get_last_scanned_block(self, user_id, chain):
+        """Get the last scanned block for a user on a specific chain"""
+        valid_chains = ['ETH', 'BNB', 'BASE', 'TRON', 'SOLANA', 'TON']
+        if chain not in valid_chains:
+            return 0
+        
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        col_name = f"last_scanned_block_{chain.lower()}"
+        cursor.execute(f'SELECT {col_name} FROM user_addresses WHERE user_id = ?', (user_id,))
+        result = cursor.fetchone()
+        conn.close()
+        return result[0] if result and result[0] else 0
+    
+    def update_last_scanned_block(self, user_id, chain, block_number):
+        """Update the last scanned block for a user on a specific chain"""
+        valid_chains = ['ETH', 'BNB', 'BASE', 'TRON', 'SOLANA', 'TON']
+        if chain not in valid_chains:
+            return
+        
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        col_name = f"last_scanned_block_{chain.lower()}"
+        cursor.execute(f'UPDATE user_addresses SET {col_name} = ? WHERE user_id = ?', (block_number, user_id))
+        conn.commit()
+        conn.close()
 
 
 class HDWalletManager:
@@ -2195,7 +2339,7 @@ class EvmService:
             return None
     
     async def sweep_token(self, from_address, private_key, token_contract, decimals):
-        """Sweep ERC20 tokens to master wallet"""
+        """Sweep ERC20 tokens to master wallet with dynamic gas estimation"""
         try:
             account = Account.from_key(private_key)
             
@@ -2219,15 +2363,27 @@ class EvmService:
                 }]
             )
             
-            # Build transaction
+            # Build transaction with dynamic gas estimation
             amount_wei = int(balance * (10 ** decimals))
+            gas_price = self.w3.eth.gas_price
+            
+            # Estimate gas dynamically
+            try:
+                estimated_gas = contract.functions.transfer(
+                    Web3.to_checksum_address(self.master_wallet),
+                    amount_wei
+                ).estimate_gas({'from': Web3.to_checksum_address(from_address)})
+                gas_limit = int(estimated_gas * 1.2)  # 20% buffer
+            except Exception:
+                gas_limit = 100000  # Fallback
+            
             tx = contract.functions.transfer(
                 Web3.to_checksum_address(self.master_wallet),
                 amount_wei
             ).build_transaction({
                 'from': Web3.to_checksum_address(from_address),
-                'gas': 100000,
-                'gasPrice': self.w3.eth.gas_price,
+                'gas': gas_limit,
+                'gasPrice': gas_price,
                 'nonce': self.w3.eth.get_transaction_count(from_address),
                 'chainId': self.w3.eth.chain_id
             })
@@ -2236,7 +2392,7 @@ class EvmService:
             signed = self.w3.eth.account.sign_transaction(tx, private_key)
             tx_hash = self.w3.eth.send_raw_transaction(signed.rawTransaction)
             
-            logging.info(f"Swept {balance} tokens from {from_address} - TX: {tx_hash.hex()}")
+            logging.info(f"Swept {balance} tokens from {from_address} (gas_limit={gas_limit}) - TX: {tx_hash.hex()}")
             return tx_hash.hex()
             
         except Exception as e:
@@ -2244,24 +2400,36 @@ class EvmService:
             return None
     
     async def fund_gas(self, to_address, amount):
-        """Fund address with gas for token transfer"""
+        """Fund address with gas for token transfer using dynamic gas estimation"""
         try:
             hot_wallet = Account.from_key(HOT_WALLET_PRIVATE_KEY)
             
+            gas_price = self.w3.eth.gas_price
+            
+            # Build initial transaction for gas estimation
             tx = {
                 'from': hot_wallet.address,
                 'to': Web3.to_checksum_address(to_address),
                 'value': self.w3.to_wei(amount, 'ether'),
-                'gas': 21000,
-                'gasPrice': self.w3.eth.gas_price,
-                'nonce': self.w3.eth.get_transaction_count(hot_wallet.address),
                 'chainId': self.w3.eth.chain_id
             }
+            
+            # Dynamic gas estimation
+            try:
+                estimated_gas = self.w3.eth.estimate_gas(tx)
+                # Add 10% buffer
+                gas_limit = int(estimated_gas * 1.1)
+            except Exception:
+                gas_limit = 21000  # Fallback for simple transfers
+            
+            tx['gas'] = gas_limit
+            tx['gasPrice'] = gas_price
+            tx['nonce'] = self.w3.eth.get_transaction_count(hot_wallet.address)
             
             signed = self.w3.eth.account.sign_transaction(tx, HOT_WALLET_PRIVATE_KEY)
             tx_hash = self.w3.eth.send_raw_transaction(signed.rawTransaction)
             
-            logging.info(f"Funded {to_address} with {amount} {self.chain} - TX: {tx_hash.hex()}")
+            logging.info(f"Funded {to_address} with {amount} {self.chain} (gas_limit={gas_limit}, gas_price={gas_price}) - TX: {tx_hash.hex()}")
             return tx_hash.hex()
             
         except Exception as e:
@@ -2664,121 +2832,247 @@ class BlockMonitor:
         await self._scan_address(chain, address, user_id, telegram_id)
     
     async def _scan_address(self, chain, address, user_id, telegram_id):
-        """Scan single address for deposits"""
+        """Scan single address for deposits using tx-level detection.
+        
+        Uses last_scanned_block from DB to scan from the last known block to the
+        current block, tracking individual transaction hashes to prevent double-crediting.
+        """
         try:
             service = self.services.get(chain)
             if not service:
                 return
             
+            # Get last scanned block from database
+            last_block = self.db.get_last_scanned_block(user_id, chain)
+            
+            # For EVM chains, use block-level scanning with get_logs
+            if chain in ('ETH', 'BNB', 'BASE'):
+                await self._scan_evm_address(service, chain, address, user_id, telegram_id, last_block)
+            else:
+                # Fallback for non-EVM chains: balance-based with tx-hash dedup
+                await self._scan_non_evm_address(service, chain, address, user_id, telegram_id, last_block)
+            
+        except Exception as e:
+            logging.error(f"Error scanning {chain} address {address}: {e}")
+    
+    async def _scan_evm_address(self, service, chain, address, user_id, telegram_id, last_block):
+        """Scan EVM address using block scanning and get_logs for ERC20 transfers"""
+        try:
+            current_block = service.w3.eth.block_number
+            start_block = last_block + 1 if last_block else max(0, current_block - 100)
+            
+            # Cap scan range to prevent timeout (max 1000 blocks)
+            if current_block - start_block > 1000:
+                start_block = current_block - 1000
+            
+            if start_block > current_block:
+                return
+            
+            checksum_addr = Web3.to_checksum_address(address)
+            
+            # --- Scan for native (ETH/BNB) deposits by checking recent blocks ---
+            # Check current native balance as a quick indicator
+            native_balance = await service.get_balance(address)
+            if native_balance > 0.0001:
+                # Generate a deterministic tx_hash based on balance+block to track this deposit
+                tx_hash = f"native_{chain}_{address}_{current_block}"
+                
+                if not self.db.is_tx_processed(tx_hash):
+                    symbol = 'ETH' if chain in ('ETH', 'BASE') else chain
+                    price_usd = await get_crypto_price_usd(symbol)
+                    amount_usd = native_balance * price_usd
+                    
+                    # Record in deposit_transactions to prevent double-crediting
+                    if self.db.record_processed_tx(tx_hash, user_id, chain, None, native_balance, current_block):
+                        self.db.add_deposit(
+                            tx_hash=tx_hash,
+                            user_id=user_id,
+                            chain=chain,
+                            amount=native_balance,
+                            amount_usd=amount_usd,
+                            to_address=address,
+                            block_number=current_block
+                        )
+                        
+                        logging.info(f"New native deposit detected: {native_balance} {symbol} for user {telegram_id} (${amount_usd:.2f})")
+                        
+                        required_confs = CONFIRMATIONS.get(chain, 10)
+                        self.db.update_deposit_status(tx_hash, 'confirmed', confirmations=required_confs)
+                        
+                        # Credit the exact coin deposited, not USD-converted active currency
+                        if telegram_id in user_wallets:
+                            credit_wallet_crypto(telegram_id, native_balance, symbol)
+                            if telegram_id in user_stats:
+                                user_stats[telegram_id]["unwagered_deposit"] = user_stats[telegram_id].get("unwagered_deposit", 0.0) + amount_usd
+                            save_user_data(telegram_id)
+                            logging.info(f"Credited {native_balance} {symbol} to user {telegram_id}")
+            
+            # --- Scan for ERC20 token deposits using get_logs ---
+            if chain in TOKEN_CONTRACTS:
+                # ERC20 Transfer event signature: Transfer(address,address,uint256)
+                transfer_topic = Web3.keccak(text="Transfer(address,address,uint256)").hex()
+                # Pad the recipient address to 32 bytes for topic filtering
+                padded_address = '0x' + checksum_addr[2:].lower().zfill(64)
+                
+                for token_name, token_info in TOKEN_CONTRACTS[chain].items():
+                    try:
+                        token_address = token_info.get('address')
+                        if not token_address:
+                            continue
+                        decimals = token_info.get('decimals', 18)
+                        
+                        # Use get_logs to find Transfer events TO this address
+                        logs = service.w3.eth.get_logs({
+                            'fromBlock': start_block,
+                            'toBlock': current_block,
+                            'address': Web3.to_checksum_address(token_address),
+                            'topics': [transfer_topic, None, padded_address]
+                        })
+                        
+                        for log in logs:
+                            log_tx_hash = log['transactionHash'].hex()
+                            
+                            # Skip if already processed
+                            if self.db.is_tx_processed(log_tx_hash):
+                                continue
+                            
+                            # Decode amount from log data
+                            amount_raw = int(log['data'].hex(), 16)
+                            token_amount = amount_raw / (10 ** decimals)
+                            
+                            if token_amount < 1:  # Minimum 1 token
+                                continue
+                            
+                            price_usd = await get_crypto_price_usd(token_name)
+                            amount_usd = token_amount * price_usd
+                            
+                            # Record and credit
+                            if self.db.record_processed_tx(log_tx_hash, user_id, chain, token_name, token_amount, log['blockNumber']):
+                                self.db.add_deposit(
+                                    tx_hash=log_tx_hash,
+                                    user_id=user_id,
+                                    chain=chain,
+                                    token=token_name,
+                                    amount=token_amount,
+                                    amount_usd=amount_usd,
+                                    to_address=address,
+                                    block_number=log['blockNumber']
+                                )
+                                
+                                logging.info(f"New token deposit: {token_amount} {token_name} on {chain} for user {telegram_id}")
+                                
+                                required_confs = CONFIRMATIONS.get(chain, 10)
+                                self.db.update_deposit_status(log_tx_hash, 'confirmed', confirmations=required_confs)
+                                
+                                # Credit exact token deposited
+                                if telegram_id in user_wallets:
+                                    credit_wallet_crypto(telegram_id, token_amount, token_name)
+                                    if telegram_id in user_stats:
+                                        user_stats[telegram_id]["unwagered_deposit"] = user_stats[telegram_id].get("unwagered_deposit", 0.0) + amount_usd
+                                    save_user_data(telegram_id)
+                                    logging.info(f"Credited {token_amount} {token_name} to user {telegram_id}")
+                    
+                    except Exception as e:
+                        logging.error(f"Error scanning {token_name} logs on {chain} for {address}: {e}")
+            
+            # Update last scanned block in database
+            self.db.update_last_scanned_block(user_id, chain, current_block)
+            
+        except Exception as e:
+            logging.error(f"Error in EVM scan for {chain} address {address}: {e}")
+    
+    async def _scan_non_evm_address(self, service, chain, address, user_id, telegram_id, last_block):
+        """Scan non-EVM address (TRON, Solana, TON) using balance check with tx-hash dedup"""
+        try:
             # Check native balance
             balance = await service.get_balance(address)
-            if balance > 0.0001:  # Minimum threshold
-                # Check if already recorded
-                conn = self.db.get_connection()
-                cursor = conn.cursor()
-                cursor.execute('''
-                    SELECT id, confirmations FROM deposits 
-                    WHERE user_id = ? AND chain = ? AND to_address = ? AND token IS NULL
-                    AND status IN ('pending', 'confirmed')
-                    ORDER BY created_at DESC LIMIT 1
-                ''', (user_id, chain, address))
+            if balance > 0.0001:
+                tx_hash = f"native_{chain}_{address}_{int(datetime.now().timestamp())}"
                 
-                existing = cursor.fetchone()
-                
-                if not existing:
-                    # New deposit detected - get price
-                    symbol = 'ETH' if chain == 'BASE' else chain.replace('CHAIN', '')
+                if not self.db.is_tx_processed(tx_hash):
+                    symbol_map = {'TRON': 'TRX', 'SOLANA': 'SOL', 'TON': 'TON'}
+                    symbol = symbol_map.get(chain, chain)
                     price_usd = await get_crypto_price_usd(symbol)
                     amount_usd = balance * price_usd
                     
-                    tx_hash = f"native_{chain}_{address}_{int(datetime.now().timestamp())}"
-                    
-                    self.db.add_deposit(
-                        tx_hash=tx_hash,
-                        user_id=user_id,
-                        chain=chain,
-                        amount=balance,
-                        amount_usd=amount_usd,
-                        to_address=address
-                    )
-                    
-                    logging.info(f"New deposit detected: {balance} {chain} for user {telegram_id} (${amount_usd:.2f})")
-                    
-                    # Update confirmations - simulate confirmation tracking
-                    required_confs = CONFIRMATIONS.get(chain, 10)
-                    self.db.update_deposit_status(tx_hash, 'confirmed', confirmations=required_confs)
-                    
-                    # Credit user only after confirmations
-                    if telegram_id in user_wallets:
-                        credit_wallet(telegram_id, amount_usd)
-                        # Track deposit for wager requirement (2x)
-                        if telegram_id in user_stats:
-                            user_stats[telegram_id]["unwagered_deposit"] = user_stats[telegram_id].get("unwagered_deposit", 0.0) + amount_usd
-                        save_user_data(telegram_id)
-                        logging.info(f"Credited ${amount_usd:.2f} to user {telegram_id}")
-                
-                conn.close()
+                    if self.db.record_processed_tx(tx_hash, user_id, chain, None, balance, 0):
+                        self.db.add_deposit(
+                            tx_hash=tx_hash,
+                            user_id=user_id,
+                            chain=chain,
+                            amount=balance,
+                            amount_usd=amount_usd,
+                            to_address=address
+                        )
+                        
+                        logging.info(f"New deposit detected: {balance} {symbol} for user {telegram_id} (${amount_usd:.2f})")
+                        
+                        required_confs = CONFIRMATIONS.get(chain, 10)
+                        self.db.update_deposit_status(tx_hash, 'confirmed', confirmations=required_confs)
+                        
+                        # Credit exact coin deposited
+                        if telegram_id in user_wallets:
+                            credit_wallet_crypto(telegram_id, balance, symbol)
+                            if telegram_id in user_stats:
+                                user_stats[telegram_id]["unwagered_deposit"] = user_stats[telegram_id].get("unwagered_deposit", 0.0) + amount_usd
+                            save_user_data(telegram_id)
+                            logging.info(f"Credited {balance} {symbol} to user {telegram_id}")
             
             # Check token balances
             if chain in TOKEN_CONTRACTS:
                 for token_name, token_info in TOKEN_CONTRACTS[chain].items():
-                    if chain == 'SOLANA':
-                        token_balance = await service.get_token_balance(address, token_info['mint'])
-                    else:
-                        token_balance = await service.get_token_balance(
-                            address, 
-                            token_info['address'],
-                            token_info['decimals']
-                        )
-                    
-                    if token_balance > 1:  # Minimum 1 token
-                        # Check if already recorded
-                        conn = self.db.get_connection()
-                        cursor = conn.cursor()
-                        cursor.execute('''
-                            SELECT id FROM deposits 
-                            WHERE user_id = ? AND chain = ? AND to_address = ? AND token = ? 
-                            AND status IN ('pending', 'confirmed')
-                            ORDER BY created_at DESC LIMIT 1
-                        ''', (user_id, chain, address, token_name))
-                        
-                        if not cursor.fetchone():
-                            tx_hash = f"token_{chain}_{token_name}_{address}_{int(datetime.now().timestamp())}"
-                            amount_usd = token_balance  # USDT/USDC are 1:1 with USD
-                            
-                            self.db.add_deposit(
-                                tx_hash=tx_hash,
-                                user_id=user_id,
-                                chain=chain,
-                                token=token_name,
-                                amount=token_balance,
-                                amount_usd=amount_usd,
-                                to_address=address
+                    try:
+                        if chain == 'SOLANA':
+                            token_balance = await service.get_token_balance(address, token_info['mint'])
+                        else:
+                            token_balance = await service.get_token_balance(
+                                address,
+                                token_info['address'],
+                                token_info['decimals']
                             )
-                            
-                            logging.info(f"New token deposit: {token_balance} {token_name} on {chain} for user {telegram_id}")
-                            
-                            # Update confirmations and credit
-                            required_confs = CONFIRMATIONS.get(chain, 10)
-                            self.db.update_deposit_status(tx_hash, 'confirmed', confirmations=required_confs)
-                            
-                            # Credit user only after confirmations
-                            if telegram_id in user_wallets:
-                                credit_wallet(telegram_id, amount_usd)
-                                # Track deposit for wager requirement (2x)
-                                if telegram_id in user_stats:
-                                    user_stats[telegram_id]["unwagered_deposit"] = user_stats[telegram_id].get("unwagered_deposit", 0.0) + amount_usd
-                                save_user_data(telegram_id)
-                                logging.info(f"Credited ${amount_usd:.2f} to user {telegram_id}")
                         
-                        conn.close()
-            
+                        if token_balance > 1:
+                            tx_hash = f"token_{chain}_{token_name}_{address}_{int(datetime.now().timestamp())}"
+                            
+                            if not self.db.is_tx_processed(tx_hash):
+                                price_usd = await get_crypto_price_usd(token_name)
+                                amount_usd = token_balance * price_usd
+                                
+                                if self.db.record_processed_tx(tx_hash, user_id, chain, token_name, token_balance, 0):
+                                    self.db.add_deposit(
+                                        tx_hash=tx_hash,
+                                        user_id=user_id,
+                                        chain=chain,
+                                        token=token_name,
+                                        amount=token_balance,
+                                        amount_usd=amount_usd,
+                                        to_address=address
+                                    )
+                                    
+                                    logging.info(f"New token deposit: {token_balance} {token_name} on {chain} for user {telegram_id}")
+                                    
+                                    required_confs = CONFIRMATIONS.get(chain, 10)
+                                    self.db.update_deposit_status(tx_hash, 'confirmed', confirmations=required_confs)
+                                    
+                                    # Credit exact token deposited
+                                    if telegram_id in user_wallets:
+                                        credit_wallet_crypto(telegram_id, token_balance, token_name)
+                                        if telegram_id in user_stats:
+                                            user_stats[telegram_id]["unwagered_deposit"] = user_stats[telegram_id].get("unwagered_deposit", 0.0) + amount_usd
+                                        save_user_data(telegram_id)
+                                        logging.info(f"Credited {token_balance} {token_name} to user {telegram_id}")
+                    
+                    except Exception as e:
+                        logging.error(f"Error scanning {token_name} on {chain} for {address}: {e}")
+        
         except Exception as e:
-            logging.error(f"Error scanning {chain} address {address}: {e}")
+            logging.error(f"Error in non-EVM scan for {chain} address {address}: {e}")
 
 
 class AutoSweeper:
     """Automatically sweeps confirmed deposits to master wallet"""
+    
+    MAX_SWEEP_RETRIES = 3
     
     def __init__(self, db: DepositDatabase):
         self.db = db
@@ -2794,17 +3088,17 @@ class AutoSweeper:
         
         try:
             self.services['TRON'] = TronService()
-        except:
+        except Exception:
             pass
         
         try:
             self.services['SOLANA'] = SolanaService()
-        except:
+        except Exception:
             pass
         
         try:
             self.services['TON'] = TonService()
-        except:
+        except Exception:
             pass
     
     async def process_pending_sweeps(self):
@@ -2828,16 +3122,25 @@ class AutoSweeper:
             for deposit in deposits:
                 dep_id, tx_hash, chain, token, amount, to_address, addr_index = deposit
                 
-                try:
-                    await self._sweep_deposit(chain, token, to_address, addr_index, tx_hash)
-                except Exception as e:
-                    logging.error(f"Error sweeping deposit {tx_hash}: {e}")
+                # Exponential backoff retry mechanism
+                for attempt in range(self.MAX_SWEEP_RETRIES):
+                    try:
+                        await self._sweep_deposit(chain, token, to_address, addr_index, tx_hash)
+                        break  # Success - exit retry loop
+                    except Exception as e:
+                        wait_time = 2 ** attempt * 5  # 5s, 10s, 20s
+                        logging.error(f"Sweep attempt {attempt + 1}/{self.MAX_SWEEP_RETRIES} failed for {tx_hash}: {e}")
+                        if attempt < self.MAX_SWEEP_RETRIES - 1:
+                            logging.info(f"Retrying sweep for {tx_hash} in {wait_time}s...")
+                            await asyncio.sleep(wait_time)
+                        else:
+                            logging.error(f"All {self.MAX_SWEEP_RETRIES} sweep attempts failed for {tx_hash}")
             
         except Exception as e:
             logging.error(f"Error in process_pending_sweeps: {e}")
     
     async def _sweep_deposit(self, chain, token, from_address, address_index, deposit_tx_hash):
-        """Sweep individual deposit"""
+        """Sweep individual deposit with robust gas confirmation"""
         try:
             service = self.services.get(chain)
             if not service:
@@ -2855,16 +3158,33 @@ class AutoSweeper:
                 
                 # Check if address has gas
                 native_balance = await service.get_balance(from_address)
-                gas_needed = GAS_AMOUNTS.get(chain, 0.001)
+                
+                # Dynamic gas estimation for EVM chains
+                if chain in ('ETH', 'BNB', 'BASE'):
+                    gas_needed = await self._estimate_gas_needed(service, chain, from_address, token)
+                else:
+                    gas_needed = GAS_AMOUNTS.get(chain, 0.001)
                 
                 if native_balance < gas_needed:
                     # Fund gas
-                    logging.info(f"Funding {gas_needed} {chain} for gas")
+                    logging.info(f"Funding {gas_needed} {chain} for gas to {from_address}")
                     gas_tx = await service.fund_gas(from_address, gas_needed)
                     
                     if gas_tx:
-                        # Wait a bit for gas to arrive
-                        await asyncio.sleep(5)
+                        # Wait for gas transaction to confirm using receipt instead of blind sleep
+                        if chain in ('ETH', 'BNB', 'BASE'):
+                            try:
+                                receipt = service.w3.eth.wait_for_transaction_receipt(gas_tx, timeout=120)
+                                if receipt['status'] != 1:
+                                    logging.error(f"Gas funding tx {gas_tx} failed with status {receipt['status']}")
+                                    return
+                                logging.info(f"Gas funding tx {gas_tx} confirmed successfully")
+                            except Exception as e:
+                                logging.error(f"Timeout waiting for gas tx receipt {gas_tx}: {e}")
+                                return
+                        else:
+                            # Non-EVM chains: short wait as fallback
+                            await asyncio.sleep(10)
                     else:
                         logging.error("Failed to fund gas")
                         return
@@ -2881,7 +3201,6 @@ class AutoSweeper:
                 if chain == 'TRON':
                     sweep_tx_hash = await service.sweep_token(from_address, private_key, token_contract)
                 elif chain == 'SOLANA':
-                    # Solana SPL token sweep would go here
                     logging.warning("Solana SPL token sweep not fully implemented")
                 else:
                     decimals = TOKEN_CONTRACTS[chain][token]['decimals']
@@ -2890,11 +3209,7 @@ class AutoSweeper:
             else:
                 # Native token sweep
                 logging.info(f"Sweeping native {chain} from {from_address}")
-                
-                if chain == 'SOLANA':
-                    sweep_tx_hash = await service.sweep(from_address, private_key)
-                else:
-                    sweep_tx_hash = await service.sweep(from_address, private_key)
+                sweep_tx_hash = await service.sweep(from_address, private_key)
             
             if sweep_tx_hash:
                 # Update database
@@ -2908,6 +3223,54 @@ class AutoSweeper:
             
         except Exception as e:
             logging.error(f"Error in _sweep_deposit: {e}")
+            raise  # Re-raise so retry mechanism catches it
+    
+    async def _estimate_gas_needed(self, service, chain, from_address, token):
+        """Dynamically estimate gas needed for a token sweep on EVM chains"""
+        try:
+            gas_price = service.w3.eth.gas_price
+            
+            # Try to estimate gas for the token transfer
+            if token and chain in TOKEN_CONTRACTS and token in TOKEN_CONTRACTS[chain]:
+                token_info = TOKEN_CONTRACTS[chain][token]
+                token_address = token_info.get('address')
+                if token_address:
+                    contract = service.w3.eth.contract(
+                        address=Web3.to_checksum_address(token_address),
+                        abi=[{
+                            "constant": False,
+                            "inputs": [
+                                {"name": "_to", "type": "address"},
+                                {"name": "_value", "type": "uint256"}
+                            ],
+                            "name": "transfer",
+                            "outputs": [{"name": "", "type": "bool"}],
+                            "type": "function"
+                        }]
+                    )
+                    
+                    try:
+                        estimated_gas = contract.functions.transfer(
+                            Web3.to_checksum_address(service.master_wallet),
+                            1  # Minimal amount for estimation
+                        ).estimate_gas({'from': Web3.to_checksum_address(from_address)})
+                    except Exception:
+                        estimated_gas = 100000  # Default fallback
+                    
+                    # Add 20% buffer for safety
+                    gas_cost_wei = gas_price * int(estimated_gas * 1.2)
+                    gas_needed = float(service.w3.from_wei(gas_cost_wei, 'ether'))
+                    
+                    # Ensure minimum threshold
+                    min_gas = GAS_AMOUNTS.get(chain, 0.001) * 0.5
+                    return max(gas_needed, min_gas)
+            
+            # Fallback to configured amounts
+            return GAS_AMOUNTS.get(chain, 0.001)
+            
+        except Exception as e:
+            logging.error(f"Error estimating gas for {chain}: {e}")
+            return GAS_AMOUNTS.get(chain, 0.001)
 
 
 # ===== DEPOSIT COMMAND HANDLERS =====
@@ -3072,7 +3435,7 @@ async def deposit_method_callback(update: Update, context: ContextTypes.DEFAULT_
 
 
 async def check_deposit_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Check deposit status - actively scans for new deposits"""
+    """Check deposit status - actively scans for new deposits from last_scanned_block"""
     query = update.callback_query
     
     # Check menu ownership BEFORE answering
@@ -3080,7 +3443,7 @@ async def check_deposit_status(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.answer("This menu is not for you.", show_alert=True)
         return
     
-    await query.answer("Checking for deposits...")
+    await query.answer("Scanning blockchain for new deposits...")
     
     user_id = query.from_user.id
     
@@ -3100,21 +3463,21 @@ async def check_deposit_status(update: Update, context: ContextTypes.DEFAULT_TYP
     
     db = DepositDatabase()
     
-    # If checking a specific chain, trigger a scan for that address
+    # If checking a specific chain, force scan from last_scanned_block to current block
     if chain_to_check:
         try:
             user_data = db.get_or_create_user(user_id)
             address = user_data.get(f"{chain_to_check.lower()}_address")
             
             if address:
-                # Trigger an immediate scan for this specific address
+                # Force a scan from last_scanned_block to current block
                 monitor = BlockMonitor(db)
                 await monitor.scan_address(chain_to_check, address, user_data['user_id'], user_id)
                 
-                await query.answer("✅ Scan complete! Check results below.", show_alert=True)
+                await query.answer("✅ Blockchain scan complete! Check results below.", show_alert=True)
         except Exception as e:
             logging.error(f"Error scanning address: {e}")
-            await query.answer("⚠️ Error scanning address", show_alert=True)
+            await query.answer("⚠️ Error scanning blockchain", show_alert=True)
     
     # Get deposit history
     deposits = db.get_user_deposits(user_id, limit=5)
