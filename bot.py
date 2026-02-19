@@ -1859,6 +1859,33 @@ class DepositDatabase:
             )
         ''')
         
+        # Rains table - tracks rain events
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS rains (
+                rain_id TEXT PRIMARY KEY,
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER,
+                creator_id INTEGER NOT NULL,
+                creator_username TEXT,
+                amount REAL NOT NULL,
+                currency TEXT DEFAULT 'USD',
+                end_time TIMESTAMP NOT NULL,
+                status TEXT DEFAULT 'active' CHECK(status IN ('active', 'completed'))
+            )
+        ''')
+        
+        # Rain participants table - tracks who joined a rain
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS rain_participants (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                rain_id TEXT NOT NULL,
+                user_id INTEGER NOT NULL,
+                username TEXT,
+                UNIQUE(rain_id, user_id),
+                FOREIGN KEY (rain_id) REFERENCES rains(rain_id)
+            )
+        ''')
+        
         # Create indexes
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_deposits_user ON deposits(user_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_deposits_status ON deposits(status)')
@@ -12793,46 +12820,216 @@ async def bank_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @check_banned
 @check_maintenance
 async def rain_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Create a rain event: /rain <amount> <duration_seconds>
+    Users can join by clicking the 'Join Rain' button within the time window."""
     user = update.effective_user
     await ensure_user_in_wallets(user.id, user.username, context=context)
     args = update.message.text.strip().split()
-    if len(args) != 3:
-        await update.message.reply_text("Usage: /rain amount N (e.g. /rain 50 2)")
+    if len(args) < 2 or len(args) > 3:
+        await update.message.reply_text(
+            "🌧️ <b>Rain Command</b>\n\n"
+            "Usage: <code>/rain amount [duration]</code>\n"
+            "• <code>amount</code> - Total USD to rain\n"
+            "• <code>duration</code> - Seconds to keep rain open (default: 60)\n\n"
+            "Example: <code>/rain 10 30</code> - Rain $10, open for 30s",
+            parse_mode=ParseMode.HTML
+        )
         return
     try:
         amount = float(args[1])
-        N = int(args[2])
-        if amount <= 0 or N <= 0: raise ValueError
+        duration = int(args[2]) if len(args) == 3 else 60
+        if amount <= 0 or duration <= 0 or duration > 300:
+            raise ValueError
     except ValueError:
-        await update.message.reply_text("Invalid amount or number.")
+        await update.message.reply_text("Invalid amount or duration. Duration must be 1-300 seconds.")
         return
 
     if get_active_balance_usd(user.id) < amount:
         await update.message.reply_text("You do not have enough funds to rain.")
         return
 
-    # FIXED: Eligible users are all registered users except the rainer
-    eligible = [uid for uid in user_stats.keys() if uid != user.id]
+    # Deduct from user immediately
+    deduct_wallet(user.id, amount)
+    save_user_data(user.id)
 
-    if N > len(eligible):
-        await update.message.reply_text(f"Not enough users to rain on! Found {len(eligible)}, need {N}.")
+    rain_id = f"RAIN_{int(datetime.now(timezone.utc).timestamp())}_{random.randint(1000, 9999)}"
+    end_time = datetime.now(timezone.utc) + timedelta(seconds=duration)
+    chat_id = update.effective_chat.id
+    creator_username = user.username or user.first_name or str(user.id)
+
+    # Store in database
+    try:
+        conn = sqlite3.connect(DEPOSITS_DB)
+        cursor = conn.cursor()
+        cursor.execute(
+            'INSERT INTO rains (rain_id, chat_id, creator_id, creator_username, amount, currency, end_time, status) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            (rain_id, chat_id, user.id, creator_username, amount, get_active_currency(user.id), end_time.isoformat(), 'active')
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logging.error(f"Error creating rain: {e}")
+        credit_wallet(user.id, amount)
+        save_user_data(user.id)
+        await update.message.reply_text("❌ Error creating rain event.")
         return
 
-    chosen = random.sample(eligible, N)
-    portion = amount / N
-    deduct_wallet(user.id, amount)
+    keyboard = [[InlineKeyboardButton("🌧️ Join Rain!", callback_data=f"join_rain_{rain_id}")]]
+    msg = await update.message.reply_text(
+        f"🌧️ <b>RAIN EVENT!</b> 🌧️\n\n"
+        f"💰 {user.mention_html()} is raining <b>${amount:.2f}</b>!\n"
+        f"⏳ Ends in <b>{duration}</b> seconds.\n\n"
+        f"Click below to join!",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+    # Store message_id for later editing
+    try:
+        conn = sqlite3.connect(DEPOSITS_DB)
+        cursor = conn.cursor()
+        cursor.execute('UPDATE rains SET message_id = ? WHERE rain_id = ?', (msg.message_id, rain_id))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logging.error(f"Error updating rain message_id: {e}")
+
+    # Schedule rain completion
+    context.job_queue.run_once(
+        complete_rain_job,
+        when=duration,
+        data={'rain_id': rain_id, 'chat_id': chat_id, 'message_id': msg.message_id, 'amount': amount, 'creator_id': user.id},
+        name=f"rain_{rain_id}"
+    )
+
+
+async def join_rain_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle user clicking 'Join Rain' button."""
+    query = update.callback_query
+    user = query.from_user
+    rain_id = query.data.replace("join_rain_", "")
+
+    await ensure_user_in_wallets(user.id, user.username, context=context)
+
+    # Check rain exists and is active
+    try:
+        conn = sqlite3.connect(DEPOSITS_DB)
+        cursor = conn.cursor()
+        cursor.execute('SELECT status, creator_id, end_time FROM rains WHERE rain_id = ?', (rain_id,))
+        rain = cursor.fetchone()
+        if not rain:
+            await query.answer("This rain event no longer exists.", show_alert=True)
+            conn.close()
+            return
+        status, creator_id, end_time_str = rain
+        if status != 'active':
+            await query.answer("This rain has already ended!", show_alert=True)
+            conn.close()
+            return
+        if user.id == creator_id:
+            await query.answer("You can't join your own rain!", show_alert=True)
+            conn.close()
+            return
+
+        # Try to add participant (UNIQUE constraint prevents double-joining)
+        username = user.username or user.first_name or str(user.id)
+        cursor.execute(
+            'INSERT INTO rain_participants (rain_id, user_id, username) VALUES (?, ?, ?)',
+            (rain_id, user.id, username)
+        )
+        conn.commit()
+        
+        # Get current participant count
+        cursor.execute('SELECT COUNT(*) FROM rain_participants WHERE rain_id = ?', (rain_id,))
+        count = cursor.fetchone()[0]
+        conn.close()
+        
+        await query.answer(f"✅ You joined the rain! ({count} participants)", show_alert=True)
+    except sqlite3.IntegrityError:
+        conn.close()
+        await query.answer("You already joined this rain!", show_alert=True)
+    except Exception as e:
+        logging.error(f"Error joining rain: {e}")
+        await query.answer("Error joining rain.", show_alert=True)
+
+
+async def complete_rain_job(context: ContextTypes.DEFAULT_TYPE):
+    """Job callback to complete a rain event and distribute funds."""
+    job_data = context.job.data
+    rain_id = job_data['rain_id']
+    chat_id = job_data['chat_id']
+    message_id = job_data['message_id']
+    amount = job_data['amount']
+    creator_id = job_data['creator_id']
+
+    try:
+        conn = sqlite3.connect(DEPOSITS_DB)
+        cursor = conn.cursor()
+        
+        # Mark rain as completed
+        cursor.execute('UPDATE rains SET status = ? WHERE rain_id = ?', ('completed', rain_id))
+        
+        # Get participants
+        cursor.execute('SELECT user_id, username FROM rain_participants WHERE rain_id = ?', (rain_id,))
+        participants = cursor.fetchall()
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logging.error(f"Error completing rain {rain_id}: {e}")
+        return
+
+    if not participants:
+        # No one joined — refund creator
+        credit_wallet(creator_id, amount)
+        save_user_data(creator_id)
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=f"🌧️ <b>Rain Ended</b>\n\nNo one joined. ${amount:.2f} refunded to creator.",
+                parse_mode=ParseMode.HTML
+            )
+        except Exception:
+            pass
+        return
+
+    # Distribute equally
+    portion = amount / len(participants)
     rained_on_users = []
-    for uid in chosen:
-        credit_wallet(uid, portion)
+    for uid, username in participants:
         await ensure_user_in_wallets(uid, context=context)
+        credit_wallet(uid, portion)
         update_stats_on_rain_received(uid, portion)
         update_pnl(uid)
         save_user_data(uid)
-        username = user_stats.get(uid, {}).get("userinfo", {}).get("username", f"ID: {uid}")
-        rained_on_users.append(f"@{username}" if username else f"ID: {uid}")
-    save_user_data(user.id)
+        rained_on_users.append(f"@{username}" if username and not username.isdigit() else f"User {uid}")
+
     rained_on_str = ", ".join(rained_on_users)
-    await update.message.reply_text(f"🌧️ Rained ${amount:.2f} on {N} users!\nEach received ${portion:.2f}.\n\nRecipients: {rained_on_str}")
+    try:
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=f"🌧️ <b>Rain Complete!</b> 🌧️\n\n"
+                 f"💰 ${amount:.2f} split among <b>{len(participants)}</b> users.\n"
+                 f"Each received: <b>${portion:.2f}</b>\n\n"
+                 f"Recipients: {rained_on_str}",
+            parse_mode=ParseMode.HTML
+        )
+    except Exception as e:
+        logging.error(f"Error editing rain message: {e}")
+        # Send a new message if editing fails
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"🌧️ <b>Rain Complete!</b> 🌧️\n\n"
+                     f"💰 ${amount:.2f} split among <b>{len(participants)}</b> users.\n"
+                     f"Each received: <b>${portion:.2f}</b>\n\n"
+                     f"Recipients: {rained_on_str}",
+                parse_mode=ParseMode.HTML
+            )
+        except Exception:
+            pass
 
 @check_banned
 @check_maintenance
@@ -14142,24 +14339,29 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     is_bot_game = match_data.get("opponent_id") == 0
                     
                     if is_bot_game and user.id == p1 and len(p1_rolls) == game_rolls:
-                        # User (host) completed rolls, now bot should roll
-                        await asyncio.sleep(1)
-                        await update.message.reply_text(f"Bot is rolling...")
-                        
-                        bot_rolls = []
-                        chat_type = update.effective_chat.type
-                        for i in range(game_rolls):
-                            animation_wait = await smart_rate_limit(chat_id, chat_type)
-                            bot_dice, used_helper = await smart_roll(context, chat_id, dice_obj.emoji)
-                            # Faster animation if helper bot was used
-                            if used_helper:
-                                await asyncio.sleep(HELPER_BOT_ANIMATION_DELAY)
-                            else:
-                                await asyncio.sleep(animation_wait)  # Smart wait based on chat type
-                            bot_rolls.append(bot_dice.dice.value)
-                        
-                        match_data["player_rolls"][p2] = bot_rolls
-                        p2_rolls = bot_rolls
+                        # Check if bot already pre-rolled (via "Bot Rolls First" button)
+                        if match_data.get("bot_rolls_first") and len(p2_rolls) == game_rolls:
+                            # Bot already rolled first — use the stored pre-rolled values
+                            pass
+                        else:
+                            # User rolled first — bot needs to roll now
+                            await asyncio.sleep(1)
+                            await update.message.reply_text(f"Bot is rolling...")
+                            
+                            bot_rolls = []
+                            chat_type = update.effective_chat.type
+                            for i in range(game_rolls):
+                                animation_wait = await smart_rate_limit(chat_id, chat_type)
+                                bot_dice, used_helper = await smart_roll(context, chat_id, dice_obj.emoji)
+                                # Faster animation if helper bot was used
+                                if used_helper:
+                                    await asyncio.sleep(HELPER_BOT_ANIMATION_DELAY)
+                                else:
+                                    await asyncio.sleep(animation_wait)  # Smart wait based on chat type
+                                bot_rolls.append(bot_dice.dice.value)
+                            
+                            match_data["player_rolls"][p2] = bot_rolls
+                            p2_rolls = bot_rolls
                     
                     if len(p1_rolls) == game_rolls and len(p2_rolls) == game_rolls:
                         # Both players completed, calculate results
@@ -14267,13 +14469,44 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             if 'pinned_message_id' in match_data:
                                 try: await context.bot.unpin_chat_message(chat_id, match_data['pinned_message_id'])
                                 except Exception as e: logging.warning(f"Could not unpin message for match {match_id}: {e}")
+                            await asyncio.sleep(HELPER_BOT_ANIMATION_DELAY)
+                            await context.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
                         else:
                             match_data["last_roller"] = None
+                            match_data["current_round"] = match_data.get("current_round", 1) + 1
                             match_data["player_rolls"] = {p1: [], p2: []}  # Reset rolls for next round
-                            text += f"\n\n<b>Next round:</b> {p1_mention} rolls first! ({allowed_emojis[gtype]} emoji)"
-
-                        await asyncio.sleep(HELPER_BOT_ANIMATION_DELAY)
-                        await context.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
+                            
+                            # If bot_rolls_first, bot rolls for the next round now
+                            if is_bot_game and match_data.get("bot_rolls_first"):
+                                text += f"\n\n<b>Next round:</b> Bot is rolling first..."
+                                await asyncio.sleep(HELPER_BOT_ANIMATION_DELAY)
+                                await context.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
+                                
+                                bot_rolls_next = []
+                                chat_type = update.effective_chat.type
+                                for i in range(game_rolls):
+                                    animation_wait = await smart_rate_limit(chat_id, chat_type)
+                                    bot_dice_next, used_helper = await smart_roll(context, chat_id, allowed_emojis.get(gtype, "🎲"))
+                                    if used_helper:
+                                        await asyncio.sleep(HELPER_BOT_ANIMATION_DELAY)
+                                    else:
+                                        await asyncio.sleep(animation_wait)
+                                    bot_rolls_next.append(bot_dice_next.dice.value)
+                                
+                                match_data["player_rolls"][p2] = bot_rolls_next
+                                bot_total_next = sum(bot_rolls_next)
+                                bot_rolls_next_text = " + ".join(str(r) for r in bot_rolls_next)
+                                
+                                await context.bot.send_message(
+                                    chat_id=chat_id,
+                                    text=f"🤖 Bot rolled: {bot_rolls_next_text} = <b>{bot_total_next}</b>\n\n"
+                                         f"{p1_mention}, <b>Your turn!</b> Send {game_rolls} {allowed_emojis.get(gtype, '🎲')} to respond.",
+                                    parse_mode=ParseMode.HTML
+                                )
+                            else:
+                                text += f"\n\n<b>Next round:</b> {p1_mention} rolls first! ({allowed_emojis[gtype]} emoji)"
+                                await asyncio.sleep(HELPER_BOT_ANIMATION_DELAY)
+                                await context.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
                     else:
                         other_id = [pid for pid in players if pid != user.id][0]
                         other_rolls = len(match_data["player_rolls"].get(other_id, []))
@@ -18612,6 +18845,9 @@ def main():
     app.add_handler(CallbackQueryHandler(deposit_method_callback, pattern=r"^deposit_(ETH|BNB|BASE|TRON|SOLANA|TON)$"))
     app.add_handler(CallbackQueryHandler(check_deposit_status, pattern=r"^(deposit_history|check_deposit_)"))
     app.add_handler(CallbackQueryHandler(back_to_deposit_menu, pattern=r"^back_to_deposit_menu"))
+    
+    # ===== RAIN SYSTEM HANDLER =====
+    app.add_handler(CallbackQueryHandler(join_rain_callback, pattern=r"^join_rain_"))
     
     # REMOVED bonus_callback_handler as it's no longer in the main menu
     app.add_handler(admin_handler)
