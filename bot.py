@@ -12852,7 +12852,7 @@ async def rain_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     deduct_wallet(user.id, amount)
     save_user_data(user.id)
 
-    rain_id = f"RAIN_{int(datetime.now(timezone.utc).timestamp())}_{random.randint(1000, 9999)}"
+    rain_id = f"RAIN_{int(datetime.now(timezone.utc).timestamp())}_{random.randint(100000, 999999)}"
     end_time = datetime.now(timezone.utc) + timedelta(seconds=duration)
     chat_id = update.effective_chat.id
     creator_username = user.username or user.first_name or str(user.id)
